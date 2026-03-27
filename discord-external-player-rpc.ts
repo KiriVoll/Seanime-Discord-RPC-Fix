@@ -3,11 +3,20 @@
 /// <reference path="./app.d.ts" />
 /// <reference path="./core.d.ts" />
 
-// Оборачиваем в IIFE, чтобы изолировать область видимости
-(function () {
-    // ═══════════════════════════════════════════════════════════
-    // HOOK LAYER — серверная сторона Seanime
-    // ═══════════════════════════════════════════════════════════
+type ExtRpcPlaybackData = {
+    mediaId: number;
+    episodeNumber: number;
+    title: string;
+    image: string;
+    isMovie: boolean;
+    totalEpisodes: number;
+    durationSeconds: number;
+    triggeredAt: number;
+};
+
+function init() {
+    const STORE_PLAYBACK_KEY = "ext_rpc_playback";
+    const STORE_STD_TRACKING_TS = "ext_rpc_std_tracking_ts";
 
     $app.onPlaybackLocalFileDetailsRequested((e) => {
         if (!e.localFile || !e.animeListEntry || !e.animeListEntry.media) {
@@ -18,64 +27,107 @@
         const media = e.animeListEntry.media;
         const localFile = e.localFile;
 
-        $store.set("ext_rpc_playback", {
+        const episodeNumber = localFile.metadata && typeof localFile.metadata.episode === "number"
+            ? localFile.metadata.episode
+            : 1;
+
+        $store.set(STORE_PLAYBACK_KEY, {
             mediaId: localFile.mediaId,
-            episodeNumber: localFile.metadata ? localFile.metadata.episode : 1,
+            episodeNumber: episodeNumber,
             title: media.title?.userPreferred || media.title?.romaji || media.title?.english || "Unknown",
             image: media.coverImage?.extraLarge || media.coverImage?.large || "",
             isMovie: media.format === "MOVIE",
-            totalEpisodes: media.episodes || 0,
-            durationSeconds: (media.duration || 24) * 60,
+            totalEpisodes: typeof media.episodes === "number" ? media.episodes : 0,
+            durationSeconds: (typeof media.duration === "number" ? media.duration : 24) * 60,
             triggeredAt: Date.now(),
-        });
+        } satisfies ExtRpcPlaybackData);
 
         e.next();
     });
 
     $app.onPlaybackBeforeTracking((e) => {
-        // Сигнал, что стандартный плеер (ПК) начал работу
-        $store.set("ext_rpc_std_tracking_ts", Date.now());
+        $store.set(STORE_STD_TRACKING_TS, Date.now());
         e.next();
     });
-
-    // ═══════════════════════════════════════════════════════════
-    // UI LAYER — браузерный контекст
-    // ═══════════════════════════════════════════════════════════
 
     $ui.register((ctx) => {
         let discordActive = false;
         let progressInterval: any = null;
-        let startTimeout: any = null;
-        let currentDuration = 0;
-        let currentProgress = 0;
+        let monitorInterval: any = null;
+        let startGraceTimeout: any = null;
 
-        function stopDiscordPresence() {
+        let activeMediaId: number | null = null;
+        let syntheticProgress = 0;
+        let syntheticDuration = 0;
+
+        function clearTimers() {
             if (progressInterval) {
                 clearInterval(progressInterval);
                 progressInterval = null;
             }
-            if (startTimeout) {
-                clearTimeout(startTimeout);
-                startTimeout = null;
+
+            if (monitorInterval) {
+                clearInterval(monitorInterval);
+                monitorInterval = null;
             }
+
+            if (startGraceTimeout) {
+                clearTimeout(startGraceTimeout);
+                startGraceTimeout = null;
+            }
+        }
+
+        function stopDiscordPresence() {
+            clearTimers();
+
             if (discordActive) {
                 try {
                     ctx.discord.cancel();
                 } catch (err) {
                     console.error("[Ext RPC] Error canceling Discord:", err);
                 }
-                discordActive = false;
             }
-            currentProgress = 0;
-            currentDuration = 0;
+
+            discordActive = false;
+            activeMediaId = null;
+            syntheticProgress = 0;
+            syntheticDuration = 0;
         }
 
-        function startDiscordPresence(data: any) {
+        function getWatchHistoryItem(mediaId: number): any | null {
+            try {
+                const item = ctx.continuity.getWatchHistoryItem(mediaId);
+                return item ?? null;
+            } catch {
+                return null;
+            }
+        }
+
+        function extractProgressFromHistory(item: any, fallbackDuration: number) {
+            const currentTime =
+                typeof item?.currentTime === "number" && !Number.isNaN(item.currentTime)
+                    ? Math.max(0, Math.floor(item.currentTime))
+                    : null;
+
+            const duration =
+                typeof item?.duration === "number" && item.duration > 0 && !Number.isNaN(item.duration)
+                    ? Math.floor(item.duration)
+                    : fallbackDuration;
+
+            const kind = typeof item?.kind === "string" ? item.kind : null;
+
+            return { currentTime, duration, kind };
+        }
+
+        function startDiscordPresence(data: ExtRpcPlaybackData, initialProgress = 0, durationOverride?: number) {
             stopDiscordPresence();
-            
+
             discordActive = true;
-            currentProgress = 0;
-            currentDuration = data.durationSeconds as number;
+            activeMediaId = data.mediaId;
+            syntheticProgress = initialProgress;
+            syntheticDuration = typeof durationOverride === "number" && durationOverride > 0
+                ? durationOverride
+                : data.durationSeconds;
 
             try {
                 ctx.discord.setAnimeActivity({
@@ -84,72 +136,117 @@
                     image: data.image,
                     isMovie: data.isMovie,
                     episodeNumber: data.episodeNumber,
-                    progress: 0,
-                    duration: currentDuration,
+                    progress: syntheticProgress,
+                    duration: syntheticDuration,
                     totalEpisodes: data.totalEpisodes > 0 ? data.totalEpisodes : undefined,
                 });
             } catch (err) {
-                console.error("[Ext RPC] Error setting activity:", err);
+                console.error("[Ext RPC] Error setting Discord activity:", err);
                 discordActive = false;
+                activeMediaId = null;
                 return;
             }
 
             progressInterval = setInterval(() => {
-                if (!discordActive) return;
-
-                currentProgress++;
-
-                try {
-                    ctx.discord.updateAnimeActivity(currentProgress, currentDuration, false);
-                } catch (err) {
-                    // Игнорируем ошибки при обновлении, чтобы не спамить в консоль
+                if (!discordActive || activeMediaId !== data.mediaId) {
+                    return;
                 }
 
-                // Авто-стоп через 2 минуты после окончания предполагаемой длительности
-                if (currentProgress >= currentDuration + 120) {
+                const historyItem = getWatchHistoryItem(data.mediaId);
+                const parsed = extractProgressFromHistory(historyItem, syntheticDuration);
+
+                if (parsed.currentTime !== null) {
+                    syntheticProgress = parsed.currentTime;
+                    syntheticDuration = parsed.duration;
+                } else {
+                    syntheticProgress += 1;
+                }
+
+                try {
+                    ctx.discord.updateAnimeActivity(
+                        syntheticProgress,
+                        syntheticDuration,
+                        false
+                    );
+                } catch {
+                    // Keep quiet; Seanime batches updates and transient failures are not fatal.
+                }
+
+                if (syntheticProgress >= syntheticDuration + 120) {
                     stopDiscordPresence();
                 }
             }, 1000);
         }
 
-        // ── Watchers ───────────────────────────────────────────
-
-        $store.watch("ext_rpc_std_tracking_ts", (ts) => {
-            if (!ts) return;
-            // Если сработал стандартный плеер - убиваем наш таймер запуска и статус
-            if (startTimeout) {
-                clearTimeout(startTimeout);
-                startTimeout = null;
-            }
-            if (discordActive) {
-                stopDiscordPresence();
-            }
-        });
-
-        $store.watch("ext_rpc_playback", (data: any) => {
-            if (!data) return;
-
-            // Сбрасываем текущий статус при запросе нового файла
+        function startExternalMonitor(data: ExtRpcPlaybackData) {
             stopDiscordPresence();
 
-            // Даем стандартному плееру 4 секунды, чтобы перехватить воспроизведение
-            startTimeout = setTimeout(() => {
-                // Дополнительная проверка на активный VideoCore в браузере
-                try {
-                    if (ctx.videoCore && typeof ctx.videoCore.getCurrentPlaybackType === "function") {
-                        const playbackType = ctx.videoCore.getCurrentPlaybackType();
-                        if (playbackType && playbackType.length > 0) {
-                            return; // Работает веб-плеер, отменяем запуск
-                        }
-                    }
-                } catch (err) {
-                    // VideoCore API недоступен, продолжаем
+            let started = false;
+            let firstSeenAt = Date.now();
+
+            monitorInterval = setInterval(() => {
+                const stdTrackingTs = $store.get<number>(STORE_STD_TRACKING_TS);
+                if (stdTrackingTs) {
+                    stopDiscordPresence();
+                    return;
                 }
 
-                // Стандартный плеер так и не запустился за 4 секунды.
-                // Значит это External Player / Direct Play. Включаем наш статус!
-                startDiscordPresence(data);
-            }, 4000); 
+                const historyItem = getWatchHistoryItem(data.mediaId);
+                const parsed = extractProgressFromHistory(historyItem, data.durationSeconds);
+
+                if (historyItem && (parsed.kind === "external_player" || parsed.currentTime !== null)) {
+                    if (!started) {
+                        startDiscordPresence(
+                            data,
+                            parsed.currentTime ?? 0,
+                            parsed.duration
+                        );
+                        started = true;
+                    }
+                    return;
+                }
+
+                if (!started && Date.now() - firstSeenAt >= 5000) {
+                    startDiscordPresence(data, 0, data.durationSeconds);
+                    started = true;
+                }
+            }, 1000);
+
+            startGraceTimeout = setTimeout(() => {
+                if (!started && !$store.get<number>(STORE_STD_TRACKING_TS)) {
+                    startDiscordPresence(data, 0, data.durationSeconds);
+                    started = true;
+                }
+            }, 5000);
+        }
+
+        $store.watch<number>(STORE_STD_TRACKING_TS, (ts) => {
+            if (!ts) {
+                return;
+            }
+
+            stopDiscordPresence();
         });
+
+        $store.watch<ExtRpcPlaybackData>(STORE_PLAYBACK_KEY, (data) => {
+            if (!data) {
+                return;
+            }
+
+            const currentStdTs = $store.get<number>(STORE_STD_TRACKING_TS);
+            if (currentStdTs) {
+                stopDiscordPresence();
+                return;
+            }
+
+            startExternalMonitor(data);
+        });
+
+        const existing = $store.get<ExtRpcPlaybackData>(STORE_PLAYBACK_KEY);
+        if (existing && !$store.get<number>(STORE_STD_TRACKING_TS)) {
+            startExternalMonitor(existing);
+        }
     });
-})();
+}
+
+export {};
